@@ -178,6 +178,36 @@ struct GenerateRequest {
     params: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Downloads an `http(s)` URL or decodes a Base64 string (optionally a `data:` URI) into raw bytes.
+async fn decode_input_bytes(input_str: &str) -> Result<Vec<u8>, String> {
+    let input_str = input_str.trim();
+    if input_str.is_empty() {
+        return Err("Empty image value".to_string());
+    }
+    if input_str.starts_with("http://") || input_str.starts_with("https://") {
+        let res = reqwest::get(input_str)
+            .await.map_err(|e| format!("Failed to download {}: {}", input_str, e))?
+            .error_for_status().map_err(|e| format!("Failed to download {}: {}", input_str, e))?;
+        Ok(res.bytes().await.map_err(|e| e.to_string())?.to_vec())
+    } else {
+        use base64::Engine;
+        let b64_str = match input_str.find("base64,") {
+            Some(idx) => &input_str[idx + 7..],
+            None => input_str,
+        };
+        base64::engine::general_purpose::STANDARD.decode(b64_str.trim()).map_err(|e| format!("Base64 Error: {}", e))
+    }
+}
+
+/// Cheap magic-byte check so non-image data is rejected with a clear 400 instead of failing inside ComfyUI.
+fn looks_like_image(b: &[u8]) -> bool {
+    b.starts_with(b"\x89PNG\r\n\x1a\n")
+        || b.starts_with(&[0xFF, 0xD8, 0xFF])
+        || b.starts_with(b"GIF8")
+        || b.starts_with(b"BM")
+        || (b.len() > 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP")
+}
+
 async fn process_image_input(
     input_str: &str,
     target: &crate::config::FieldInputTarget,
@@ -195,21 +225,7 @@ async fn process_image_input(
         return Ok((input_str.to_string(), None));
     }
 
-    let raw_bytes = if is_url {
-        reqwest::get(input_str)
-            .await.map_err(|e| e.to_string())?
-            .bytes()
-            .await.map_err(|e| e.to_string())?
-            .to_vec()
-    } else {
-        use base64::Engine;
-        let b64_str = if let Some(idx) = input_str.find("base64,") {
-            &input_str[idx + 7..]
-        } else {
-            input_str
-        };
-        base64::engine::general_purpose::STANDARD.decode(b64_str.trim()).map_err(|e| format!("Base64 Error: {}", e))?
-    };
+    let raw_bytes = decode_input_bytes(input_str).await?;
 
     if target == &crate::config::FieldInputTarget::Text {
         return Ok((input_str.to_string(), None));
@@ -333,12 +349,19 @@ async fn upload_reference_images(
         }
     }
     let mut names = Vec::new();
-    for src in sources {
-        match process_image_input(src, &crate::config::FieldInputTarget::ComfyUpload, comfy_client, temp_images, None).await {
+    for (i, src) in sources.iter().enumerate() {
+        let result = async {
+            let bytes = decode_input_bytes(src).await?;
+            if !looks_like_image(&bytes) {
+                return Err("data is not a supported image (PNG, JPEG, WebP, GIF or BMP)".to_string());
+            }
+            process_raw_image_bytes(bytes, &crate::config::FieldInputTarget::ComfyUpload, comfy_client, temp_images, None).await
+        }.await;
+        match result {
             Ok((name, _)) => names.push(name),
             Err(e) => {
                 comfy_client.cleanup_files(&names).await;
-                return Err(e);
+                return Err(format!("image #{}: {}", i + 1, e));
             }
         }
     }
@@ -434,9 +457,15 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
             return (StatusCode::BAD_REQUEST, "This workflow does not support input images").into_response();
         };
         let sources: Vec<String> = match images {
-            serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            serde_json::Value::Array(a) => {
+                let strs: Vec<String> = a.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                if strs.len() != a.len() {
+                    return (StatusCode::BAD_REQUEST, "`images` must be an array of URLs/Base64 strings").into_response();
+                }
+                strs
+            }
             serde_json::Value::String(s) => vec![s.clone()],
-            _ => Vec::new(),
+            _ => return (StatusCode::BAD_REQUEST, "`images` must be an array of URLs/Base64 strings").into_response(),
         };
         match upload_reference_images(&sources, img_cfg, &state.comfy_client, &state.temp_images).await {
             Ok(names) => {
@@ -694,7 +723,10 @@ async fn openai_edits_handler(
                 return (StatusCode::BAD_REQUEST, format!("Too many images: {} (max {})", all_images.len(), max)).into_response();
             }
         }
-        for bytes in &all_images {
+        for (i, bytes) in all_images.iter().enumerate() {
+            if !looks_like_image(bytes) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {"message": format!("image #{} is not a supported image (PNG, JPEG, WebP, GIF or BMP)", i + 1), "type": "invalid_request_error"}}))).into_response();
+            }
             match process_raw_image_bytes(bytes.clone(), &crate::config::FieldInputTarget::ComfyUpload, &state.comfy_client, &state.temp_images, host_header).await {
                 Ok((name, _)) => names.push(name),
                 Err(e) => {
@@ -707,7 +739,7 @@ async fn openai_edits_handler(
             state.comfy_client.cleanup_files(&names).await;
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-        uploaded_files.extend(names);
+        cleanup.files.extend(names);
     }
 
     for field_map in &wf_config.exposed_fields {
