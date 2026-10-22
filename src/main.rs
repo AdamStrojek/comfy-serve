@@ -249,6 +249,49 @@ async fn process_raw_image_bytes(
     }
 }
 
+/// Removes uploaded ComfyUI input files and temp-hosted images when dropped, so cleanup also runs
+/// when the client disconnects and axum drops the handler future mid-flight.
+struct CleanupGuard {
+    comfy_client: Arc<comfy::ComfyClient>,
+    temp_images: Arc<RwLock<std::collections::HashMap<String, Vec<u8>>>>,
+    files: Vec<String>,
+    ids: Vec<String>,
+}
+
+impl CleanupGuard {
+    fn new(state: &AppState) -> Self {
+        Self {
+            comfy_client: state.comfy_client.clone(),
+            temp_images: state.temp_images.clone(),
+            files: Vec::new(),
+            ids: Vec::new(),
+        }
+    }
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if self.files.is_empty() && self.ids.is_empty() {
+            return;
+        }
+        let client = self.comfy_client.clone();
+        let temp_images = self.temp_images.clone();
+        let files = std::mem::take(&mut self.files);
+        let ids = std::mem::take(&mut self.ids);
+        tokio::spawn(async move {
+            if !files.is_empty() {
+                client.cleanup_files(&files).await;
+            }
+            if !ids.is_empty() {
+                let mut temp = temp_images.write().await;
+                for id in ids {
+                    temp.remove(&id);
+                }
+            }
+        });
+    }
+}
+
 async fn generate_handler(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(payload): Json<GenerateRequest>) -> impl IntoResponse {
     if !state.api_keys.is_empty() {
         let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
@@ -278,8 +321,7 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
         None => return (StatusCode::BAD_REQUEST, "Workflow JSON not found").into_response(),
     };
 
-    let mut temp_cleanup_ids = Vec::new();
-    let mut uploaded_files = Vec::new();
+    let mut cleanup = CleanupGuard::new(&state);
     let host_header = headers.get("host").and_then(|h| h.to_str().ok());
 
     // Required checks and apply mappings
@@ -303,11 +345,11 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
                     Ok((processed_str, temp_id)) => {
                         if field_map.input_target == crate::config::FieldInputTarget::ComfyUpload 
                             || field_map.input_target == crate::config::FieldInputTarget::AudioUpload {
-                            uploaded_files.push(processed_str.clone());
+                            cleanup.files.push(processed_str.clone());
                         }
                         final_val = serde_json::Value::String(processed_str);
                         if let Some(id) = temp_id {
-                            temp_cleanup_ids.push(id);
+                            cleanup.ids.push(id);
                         }
                     }
                     Err(e) => return (StatusCode::BAD_REQUEST, format!("Image processing failed for {}: {}", field_map.exposed_as, e)).into_response(),
@@ -346,14 +388,7 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
-    // Cleanup temp images
-    if !temp_cleanup_ids.is_empty() {
-        let mut temp_images = state.temp_images.write().await;
-        for id in temp_cleanup_ids {
-            temp_images.remove(&id);
-        }
-    }
-
+    // Uploaded files and temp images are removed by `cleanup` on drop
     res
 }
 
@@ -571,8 +606,7 @@ async fn openai_edits_handler(
     };
     
     let host_header = headers.get("host").and_then(|h| h.to_str().ok());
-    let mut temp_cleanup_ids = Vec::new();
-    let mut uploaded_files = Vec::new();
+    let mut cleanup = CleanupGuard::new(&state);
 
     for field_map in &wf_config.exposed_fields {
         let mut final_val = None;
@@ -584,11 +618,11 @@ async fn openai_edits_handler(
                 Ok((res_val, cleanup_id)) => {
                     if field_map.input_target == crate::config::FieldInputTarget::ComfyUpload 
                         || field_map.input_target == crate::config::FieldInputTarget::AudioUpload {
-                        uploaded_files.push(res_val.clone());
+                        cleanup.files.push(res_val.clone());
                     }
                     final_val = Some(serde_json::Value::String(res_val));
                     if let Some(id) = cleanup_id {
-                        temp_cleanup_ids.push(id);
+                        cleanup.ids.push(id);
                     }
                 }
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to process image: {}", e)).into_response(),
@@ -609,14 +643,7 @@ async fn openai_edits_handler(
 
     let submit_result = state.comfy_client.submit_prompt(wf_json).await;
 
-    // Cleanup temp hosted images and uploaded files
-    for id in temp_cleanup_ids {
-        state.temp_images.write().await.remove(&id);
-    }
-    if !uploaded_files.is_empty() {
-        state.comfy_client.cleanup_files(&uploaded_files).await;
-    }
-
+    // Uploaded files and temp images are removed by `cleanup` on drop
     match submit_result {
         Ok(output_assets) => {
             use base64::Engine;

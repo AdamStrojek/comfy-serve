@@ -51,6 +51,54 @@ pub fn derive_content_type(filename: &str) -> (String, String) {
     }
 }
 
+/// True if `prompt_id` is in the `queue_running` list of a ComfyUI `/queue` response.
+fn is_running(queue: &serde_json::Value, prompt_id: &str) -> bool {
+    queue
+        .get("queue_running")
+        .and_then(|q| q.as_array())
+        .map(|jobs| jobs.iter().any(|j| j.get(1).and_then(|id| id.as_str()) == Some(prompt_id)))
+        .unwrap_or(false)
+}
+
+/// Cancels a submitted ComfyUI job when dropped while still armed, i.e. when the request future is
+/// dropped (client disconnect) before execution finished.
+struct CancelOnDrop {
+    http: Client,
+    base_url: String,
+    prompt_id: String,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let prompt_id = self.prompt_id.clone();
+        tokio::spawn(async move {
+            tracing::info!("Client disconnected, cancelling ComfyUI job {}", prompt_id);
+            // Remove it if still pending in the queue
+            let _ = http.post(format!("{}/queue", base_url))
+                .json(&serde_json::json!({ "delete": [prompt_id] }))
+                .send()
+                .await;
+            // Interrupt it only if it is the job currently executing
+            let running = match http.get(format!("{}/queue", base_url)).send().await {
+                Ok(res) => res.json::<serde_json::Value>().await.map(|q| is_running(&q, &prompt_id)).unwrap_or(false),
+                Err(_) => false,
+            };
+            if running {
+                let _ = http.post(format!("{}/interrupt", base_url))
+                    .json(&serde_json::json!({ "prompt_id": prompt_id }))
+                    .send()
+                    .await;
+            }
+        });
+    }
+}
+
 pub struct ComfyClient {
     base_url: String,
     http: Client,
@@ -123,6 +171,12 @@ impl ComfyClient {
         }
 
         let prompt_id = prompt_res.prompt_id;
+        let mut cancel_guard = CancelOnDrop {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            prompt_id: prompt_id.clone(),
+            armed: true,
+        };
 
         // Connect WS to wait for completion
         let ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://");
@@ -183,6 +237,8 @@ impl ComfyClient {
                 _ => {}
             }
         }
+
+        cancel_guard.armed = false;
 
         // Fetch history for standard SaveImage / SaveAudio nodes
         let history_url = format!("{}/history/{}", self.base_url, prompt_id);
@@ -371,6 +427,17 @@ pub fn get_workflows() -> Result<HashMap<String, serde_json::Value>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_is_running() {
+        let q = serde_json::json!({
+            "queue_running": [[0, "abc", {}, {}, []]],
+            "queue_pending": [[1, "def", {}, {}, []]]
+        });
+        assert!(super::is_running(&q, "abc"));
+        assert!(!super::is_running(&q, "def"));
+        assert!(!super::is_running(&serde_json::json!({}), "abc"));
+    }
+
     use super::*;
     use std::fs;
     use std::path::PathBuf;
