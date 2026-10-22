@@ -249,6 +249,59 @@ async fn process_raw_image_bytes(
     }
 }
 
+/// Adds a `LoadImage` node (`reference_N`) for every uploaded file and links it to
+/// `<field_prefix><N>` of the configured node, so images become optional workflow inputs.
+fn inject_reference_images(
+    wf_json: &mut serde_json::Value,
+    cfg: &crate::config::ImageInputsConfig,
+    uploaded_names: &[String],
+) -> Result<(), String> {
+    let obj = wf_json.as_object_mut().ok_or("Workflow JSON is not an object")?;
+    if !obj.contains_key(&cfg.node_id) {
+        return Err(format!("Image input node '{}' not found in workflow", cfg.node_id));
+    }
+    for (i, name) in uploaded_names.iter().enumerate() {
+        let n = i + 1;
+        let mut node_id = format!("reference_{}", n);
+        while obj.contains_key(&node_id) {
+            node_id.push('_');
+        }
+        obj.insert(node_id.clone(), serde_json::json!({
+            "class_type": "LoadImage",
+            "inputs": { "image": name },
+        }));
+        if let Some(inputs) = obj.get_mut(&cfg.node_id).and_then(|nd| nd.get_mut("inputs")).and_then(|i| i.as_object_mut()) {
+            inputs.insert(format!("{}{}", cfg.field_prefix, n), serde_json::json!([node_id, 0]));
+        }
+    }
+    Ok(())
+}
+
+/// Uploads each image (URL or Base64) to ComfyUI and returns the stored filenames.
+async fn upload_reference_images(
+    sources: &[String],
+    cfg: &crate::config::ImageInputsConfig,
+    comfy_client: &crate::comfy::ComfyClient,
+    temp_images: &Arc<RwLock<std::collections::HashMap<String, Vec<u8>>>>,
+) -> Result<Vec<String>, String> {
+    if let Some(max) = cfg.max_images {
+        if sources.len() > max {
+            return Err(format!("Too many images: {} (max {})", sources.len(), max));
+        }
+    }
+    let mut names = Vec::new();
+    for src in sources {
+        match process_image_input(src, &crate::config::FieldInputTarget::ComfyUpload, comfy_client, temp_images, None).await {
+            Ok((name, _)) => names.push(name),
+            Err(e) => {
+                comfy_client.cleanup_files(&names).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(names)
+}
+
 async fn generate_handler(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(payload): Json<GenerateRequest>) -> impl IntoResponse {
     if !state.api_keys.is_empty() {
         let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
@@ -333,6 +386,33 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
         }
     }
 
+    // Optional input images
+    if let Some(images) = payload.params.get("images").filter(|v| !v.is_null()) {
+        let Some(img_cfg) = &wf_config.image_inputs else {
+            state.comfy_client.cleanup_files(&uploaded_files).await;
+            return (StatusCode::BAD_REQUEST, "This workflow does not support input images").into_response();
+        };
+        let sources: Vec<String> = match images {
+            serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            serde_json::Value::String(s) => vec![s.clone()],
+            _ => Vec::new(),
+        };
+        match upload_reference_images(&sources, img_cfg, &state.comfy_client, &state.temp_images).await {
+            Ok(names) => {
+                if let Err(e) = inject_reference_images(&mut wf_json, img_cfg, &names) {
+                    state.comfy_client.cleanup_files(&names).await;
+                    state.comfy_client.cleanup_files(&uploaded_files).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                }
+                uploaded_files.extend(names);
+            }
+            Err(e) => {
+                state.comfy_client.cleanup_files(&uploaded_files).await;
+                return (StatusCode::BAD_REQUEST, format!("Image processing failed for images: {}", e)).into_response();
+            }
+        }
+    }
+
     // Submit to ComfyUI
     let res = match state.comfy_client.submit_prompt(wf_json).await {
         Ok(output_assets) => {
@@ -346,7 +426,10 @@ async fn generate_handler(State(state): State<AppState>, headers: axum::http::He
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
-    // Cleanup temp images
+    // Cleanup uploaded files and temp images
+    if !uploaded_files.is_empty() {
+        state.comfy_client.cleanup_files(&uploaded_files).await;
+    }
     if !temp_cleanup_ids.is_empty() {
         let mut temp_images = state.temp_images.write().await;
         for id in temp_cleanup_ids {
@@ -505,6 +588,7 @@ async fn openai_edits_handler(
 
     let mut prompt: Option<String> = None;
     let mut image_bytes: Option<Vec<u8>> = None;
+    let mut all_images: Vec<Vec<u8>> = Vec::new();
     let mut model: Option<String> = None;
     
     let parts = parse_lenient_multipart(&bytes, &boundary);
@@ -512,6 +596,7 @@ async fn openai_edits_handler(
         if name == "prompt" {
             prompt = String::from_utf8(data).ok();
         } else if name == "image" || name == "image[]" {
+            all_images.push(data.clone());
             image_bytes = Some(data);
         } else if name == "model" {
             model = String::from_utf8(data).ok();
@@ -574,12 +659,35 @@ async fn openai_edits_handler(
     let mut temp_cleanup_ids = Vec::new();
     let mut uploaded_files = Vec::new();
 
+    if let Some(img_cfg) = &wf_config.image_inputs {
+        let mut names = Vec::new();
+        if let Some(max) = img_cfg.max_images {
+            if all_images.len() > max {
+                return (StatusCode::BAD_REQUEST, format!("Too many images: {} (max {})", all_images.len(), max)).into_response();
+            }
+        }
+        for bytes in &all_images {
+            match process_raw_image_bytes(bytes.clone(), &crate::config::FieldInputTarget::ComfyUpload, &state.comfy_client, &state.temp_images, host_header).await {
+                Ok((name, _)) => names.push(name),
+                Err(e) => {
+                    state.comfy_client.cleanup_files(&names).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to process image: {}", e)).into_response();
+                }
+            }
+        }
+        if let Err(e) = inject_reference_images(&mut wf_json, img_cfg, &names) {
+            state.comfy_client.cleanup_files(&names).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        uploaded_files.extend(names);
+    }
+
     for field_map in &wf_config.exposed_fields {
         let mut final_val = None;
 
         if field_map.exposed_as == "prompt" {
             final_val = Some(serde_json::Value::String(prompt.clone()));
-        } else if field_map.exposed_as == "image" {
+        } else if field_map.exposed_as == "image" && wf_config.image_inputs.is_none() {
             match process_raw_image_bytes(image_bytes.clone(), &field_map.input_target, &state.comfy_client, &state.temp_images, host_header).await {
                 Ok((res_val, cleanup_id)) => {
                     if field_map.input_target == crate::config::FieldInputTarget::ComfyUpload 
@@ -787,6 +895,7 @@ async fn openapi_spec_handler(State(state): State<AppState>, headers: axum::http
 struct NativeModelInfo {
     id: String,
     fields: Vec<crate::config::WorkflowFieldMap>,
+    supports_images: bool,
 }
 
 async fn native_models_handler(State(state): State<AppState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
@@ -812,6 +921,7 @@ async fn native_models_handler(State(state): State<AppState>, headers: axum::htt
             models.push(NativeModelInfo {
                 id: name.clone(),
                 fields: c.exposed_fields.clone(),
+                supports_images: c.image_inputs.is_some(),
             });
         }
     }
@@ -1311,4 +1421,26 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+#[cfg(test)]
+mod image_input_tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_reference_images() {
+        let mut wf = serde_json::json!({"prompt": {"class_type": "X", "inputs": {"prompt": ""}}});
+        let cfg = crate::config::ImageInputsConfig {
+            node_id: "prompt".into(),
+            field_prefix: "images.image_".into(),
+            max_images: None,
+        };
+        inject_reference_images(&mut wf, &cfg, &["a.png".into(), "b.png".into()]).unwrap();
+        assert_eq!(wf["reference_1"]["class_type"], "LoadImage");
+        assert_eq!(wf["reference_2"]["inputs"]["image"], "b.png");
+        assert_eq!(wf["prompt"]["inputs"]["images.image_2"], serde_json::json!(["reference_2", 0]));
+
+        let bad = crate::config::ImageInputsConfig { node_id: "nope".into(), ..cfg };
+        assert!(inject_reference_images(&mut wf, &bad, &["a.png".into()]).is_err());
+    }
 }
