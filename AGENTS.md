@@ -13,6 +13,7 @@ This file serves as documentation for AI agents continuing work on the `comfy-se
 - `src/` - Rust backend source code.
   - `main.rs` - Axum router, state management, and API endpoints.
   - `config.rs` - Configuration serialization (`config.toml`), including the `FieldInputTarget` enum (text, image_base64, image_url, comfy_upload, audio_upload).
+  - `video.rs` - Asynchronous, OpenRouter-style video API (`/api/v1/videos`) on the workflows in `active-workflows/video/`.
   - `comfy.rs` - Logic to submit prompts to ComfyUI via HTTP/WebSocket and retrieve results (both image and audio outputs).
   - `auth.rs` - Argon2 password hashing logic for the dashboard.
 - `frontend/` - React frontend source code.
@@ -38,6 +39,7 @@ If you need to make changes to the dashboard UI:
 - `POST /api/generate` - The main custom generation endpoint. Supports both image and audio workflows — the response `Content-Type` is set dynamically based on the output type (e.g., `image/png`, `audio/mpeg`). (Secured by `Authorization: Bearer <key>` if `API_KEYS` is configured in `.env`)
 - `POST /v1/images/generations` and `POST /v1/images/edits` - OpenAI compatible endpoints mimicking DALL-E image generation and edit requests. `generations` maps the "prompt" JSON string to a specific field exposed as `prompt`. `edits` accepts `multipart/form-data`, mapping the `prompt` string to the `prompt` field and the `image` binary to the `image` field. (Secured by `Authorization: Bearer <key>` if `API_KEYS` is configured in `.env`)
 - `POST /api/login` - Authenticates a dashboard session.
+- `POST /api/v1/videos`, `GET /api/v1/videos/{id}`, `GET /api/v1/videos/{id}/content`, `DELETE /api/v1/videos/{id}`, `GET /api/v1/videos/models` - Asynchronous video generation, see below and `docs/video-api.md`. (Secured by `Authorization: Bearer <key>` if `API_KEYS` is configured in `.env`)
 
 ## State Management
 
@@ -63,6 +65,18 @@ A workflow can accept any number of optional reference images without fixed `Loa
 - `POST /v1/images/edits` routes all `image`/`image[]` parts through the same mechanism when `image_inputs` is set.
 - `GET /api/models` reports `supports_images`.
 - Uploaded files are removed afterwards when `--cleanup-input` is set.
+
+## Video Generation (async)
+
+`src/video.rs` mimics OpenRouter's video API (`POST` → `202 {id, polling_url, status}`, poll, download), but runs on ComfyUI and takes reference files as multipart parts instead of URLs. User-facing docs: `docs/video-api.md`.
+- **Stateless**: the job id is ComfyUI's `prompt_id`. Status comes from `/history/<id>` (finished: `completed` / `failed` / `cancelled` from `status.status_str` and `messages`) and `/queue` (`in_progress` / `pending`); `/content` streams the file from `/view` (`reqwest` `stream` feature). Nothing is kept in comfy-serve, so a job ComfyUI forgot (history cleared, restart, removed from the queue) is a `404`. `ComfyClient::queue_prompt` submits without the WebSocket wait; `cancel_prompt` is shared with `CancelOnDrop`.
+- **Workflows** are the files in `active-workflows/video/` (model id = file stem), served only when `config.toml` has `[video_workflows.<name>]` with `active = true` (`VideoWorkflowConfig` in `config.rs`). They are edited only in `config.toml` — the dashboard does not show them (`get_workflows` reads only the top level) but round-trips the section when it saves. Every other key has a `#[serde(default)]` matching the MiniMax H3 conventions, so `active = true` is enough for a workflow built the same way:
+  - nodes: `i2v_node = "generator_i2v"` and `r2v_node = "generator_r2v"` are popped and the needed one is inserted as `generator_node = "generator"`; `seed_node`/`seed_field` (`rnd_seed.noise_seed`), `denoise_node` (`scheduler`, set to 1 if present; empty to skip), `output_node` (`video_output`, gets `filename_prefix`).
+  - generator fields: `prompt_field`, `width_field`, `height_field`, `length_field`, `first_frame_field`, `last_frame_field`, and the prefixes `image_prefix = "ref_images."`, `audio_prefix`, `video_prefix` followed by the loader node id (`ref_image_N`, `ref_audio_N`, `ref_video_N`).
+  - limits: `min_duration`/`max_duration`/`default_duration` (5/15/5 s, integers only), `fps` (24), `frame_step`/`frame_offset` (frames rounded up to `17k+5`), `size_multiple` (64), `resolutions` (`"<short side>p"`), `aspect_ratios`, `default_resolution`, `default_aspect_ratio`, optional `max_images`/`max_audios`/`max_videos`. `GET /api/v1/videos/models` reports them.
+- **Request**: multipart part `request` (JSON) + file parts `first_frame`, `last_frame` (→ i2v) or `image`, `audio`, `video` (→ r2v, repeatable); plain JSON for text-to-video. Uploads go through `/upload/image`; videos are loaded with `LoadVideo` + `GetVideoComponents`, `video_sound: [n]` links the n-th video's sound as an audio reference. Width/height come from `resolution` (short side) + `aspect_ratio`, or `size`.
+- Only history entries with `type: "output"` are results — `LoadVideo` lists its input as a preview too.
+- Uploaded references are not cleaned up and `--cleanup` does not touch videos: comfy-serve does not know when the client downloaded them.
 
 ## LLM Assisted Restructure
 

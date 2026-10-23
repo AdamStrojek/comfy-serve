@@ -2,6 +2,7 @@ mod config;
 mod auth;
 mod comfy;
 mod llm;
+mod video;
 
 #[cfg(feature = "dashboard")]
 use axum::http::Uri;
@@ -125,6 +126,19 @@ async fn update_config_handler(State(state): State<AppState>, headers: axum::htt
     }
     
     (StatusCode::OK, "Config updated").into_response()
+}
+
+/// Rejects the request unless it carries one of `API_KEYS` (when any are configured).
+fn check_api_key(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), Response> {
+    if state.api_keys.is_empty() {
+        return Ok(());
+    }
+    let token = headers.get("Authorization").and_then(|h| h.to_str().ok()).unwrap_or("").replace("Bearer ", "");
+    if state.api_keys.contains(&token) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response())
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1376,6 +1390,10 @@ async fn main() {
         .route("/v1/images/edits", post(openai_edits_handler))
         .route("/v1/models", get(openai_models_handler))
         .route("/v1/openapi.json", get(openapi_spec_handler))
+        .route("/api/v1/videos", post(video::create_video_handler))
+        .route("/api/v1/videos/models", get(video::video_models_handler))
+        .route("/api/v1/videos/{id}", get(video::get_video_handler).delete(video::cancel_video_handler))
+        .route("/api/v1/videos/{id}/content", get(video::video_content_handler))
         .route("/api/login", post(login_handler))
         .route("/api/auth_check", get(check_auth_handler))
         .route("/api/restructure", post(restructure_handler))

@@ -47,6 +47,12 @@ pub fn derive_content_type(filename: &str) -> (String, String) {
         "mp3"  => ("audio/mpeg".to_string(), "mp3".to_string()),
         "flac" => ("audio/flac".to_string(), "flac".to_string()),
         "opus" => ("audio/opus".to_string(), "opus".to_string()),
+        "ogg"  => ("audio/ogg".to_string(), "ogg".to_string()),
+        "m4a"  => ("audio/mp4".to_string(), "m4a".to_string()),
+        "mp4"  => ("video/mp4".to_string(), "mp4".to_string()),
+        "webm" => ("video/webm".to_string(), "webm".to_string()),
+        "mov"  => ("video/quicktime".to_string(), "mov".to_string()),
+        "mkv"  => ("video/x-matroska".to_string(), "mkv".to_string()),
         _      => ("application/octet-stream".to_string(), "bin".to_string()),
     }
 }
@@ -79,23 +85,26 @@ impl Drop for CancelOnDrop {
         let prompt_id = self.prompt_id.clone();
         tokio::spawn(async move {
             tracing::info!("Client disconnected, cancelling ComfyUI job {}", prompt_id);
-            // Remove it if still pending in the queue
-            let _ = http.post(format!("{}/queue", base_url))
-                .json(&serde_json::json!({ "delete": [prompt_id] }))
-                .send()
-                .await;
-            // Interrupt it only if it is the job currently executing
-            let running = match http.get(format!("{}/queue", base_url)).send().await {
-                Ok(res) => res.json::<serde_json::Value>().await.map(|q| is_running(&q, &prompt_id)).unwrap_or(false),
-                Err(_) => false,
-            };
-            if running {
-                let _ = http.post(format!("{}/interrupt", base_url))
-                    .json(&serde_json::json!({ "prompt_id": prompt_id }))
-                    .send()
-                    .await;
-            }
+            cancel_prompt(&http, &base_url, &prompt_id).await;
         });
+    }
+}
+
+/// Removes a job from ComfyUI's queue, and interrupts it if it is the job currently executing.
+async fn cancel_prompt(http: &Client, base_url: &str, prompt_id: &str) {
+    let _ = http.post(format!("{}/queue", base_url))
+        .json(&serde_json::json!({ "delete": [prompt_id] }))
+        .send()
+        .await;
+    let running = match http.get(format!("{}/queue", base_url)).send().await {
+        Ok(res) => res.json::<serde_json::Value>().await.map(|q| is_running(&q, prompt_id)).unwrap_or(false),
+        Err(_) => false,
+    };
+    if running {
+        let _ = http.post(format!("{}/interrupt", base_url))
+            .json(&serde_json::json!({ "prompt_id": prompt_id }))
+            .send()
+            .await;
     }
 }
 
@@ -118,33 +127,37 @@ impl ComfyClient {
         }
     }
 
-    pub async fn submit_prompt(&self, mut prompt_json: serde_json::Value) -> Result<Vec<OutputAsset>, String> {
-        let client_id = Uuid::new_v4().to_string();
-        
-        // Find all Save nodes and prevent caching
+    /// Injects the cache-busting salt into Save nodes and returns the ids of `SaveImageWebsocket` nodes.
+    fn salt_save_nodes(&self, prompt_json: &mut serde_json::Value, salt: &str) -> std::collections::HashSet<String> {
         let mut ws_image_nodes = std::collections::HashSet::new();
         if let Some(obj) = prompt_json.as_object_mut() {
             for (node_id, node) in obj {
                 if let Some(class_type) = node.get("class_type").and_then(|c| c.as_str()) {
                     let is_ws_save = class_type == "SaveImageWebsocket";
-                    let is_disk_save = class_type.starts_with("SaveImage") || class_type.starts_with("SaveAudio");
-                    
+                    let is_disk_save = class_type.starts_with("SaveImage")
+                        || class_type.starts_with("SaveAudio")
+                        || class_type.starts_with("SaveVideo");
+
                     if is_ws_save || (is_disk_save && self.cleanup_dir.is_some()) {
                         if is_ws_save {
                             ws_image_nodes.insert(node_id.clone());
                         }
                         // Inject a random string to inputs to prevent ComfyUI from caching this node
                         if let Some(inputs) = node.get_mut("inputs").and_then(|i| i.as_object_mut()) {
-                            inputs.insert("comfy_serve_salt".to_string(), serde_json::json!(client_id.clone()));
+                            inputs.insert("comfy_serve_salt".to_string(), serde_json::json!(salt));
                         }
                     }
                 }
             }
         }
+        ws_image_nodes
+    }
 
+    /// Posts the workflow to ComfyUI's `/prompt` and returns its `prompt_id`.
+    async fn post_prompt(&self, prompt_json: serde_json::Value, client_id: &str) -> Result<String, String> {
         let prompt_req = ComfyPrompt {
-            prompt: prompt_json.clone(),
-            client_id: client_id.clone(),
+            prompt: prompt_json,
+            client_id: client_id.to_string(),
         };
 
         if self.log_workflow {
@@ -153,24 +166,39 @@ impl ComfyClient {
             tracing::debug!("ComfyUI Request: [Workflow logging disabled]");
         }
 
-        // Submit prompt
         let res = self.http.post(format!("{}/prompt", self.base_url))
             .json(&prompt_req)
             .send()
             .await
             .map_err(|e| e.to_string())?;
 
-        let prompt_res: ComfyPromptResponse = res.json().await.map_err(|e| e.to_string())?;
+        let status = res.status();
+        let body = res.text().await.map_err(|e| e.to_string())?;
+        let prompt_res: ComfyPromptResponse = serde_json::from_str(&body)
+            .map_err(|_| format!("ComfyUI rejected the prompt ({}): {}", status, body))?;
 
         tracing::debug!("ComfyUI Response: {}", serde_json::to_string_pretty(&prompt_res).unwrap_or_else(|_| "Invalid JSON".to_string()));
-        
+
         if let Some(errs) = prompt_res.node_errors {
-            if !errs.as_object().unwrap().is_empty() {
+            if errs.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
                 return Err(format!("ComfyUI Node Errors: {:?}", errs));
             }
         }
+        Ok(prompt_res.prompt_id)
+    }
 
-        let prompt_id = prompt_res.prompt_id;
+    /// Queues the workflow without waiting for it; the job is followed with `get_history` / `get_queue`.
+    pub async fn queue_prompt(&self, mut prompt_json: serde_json::Value) -> Result<String, String> {
+        let client_id = Uuid::new_v4().to_string();
+        self.salt_save_nodes(&mut prompt_json, &client_id);
+        self.post_prompt(prompt_json, &client_id).await
+    }
+
+    pub async fn submit_prompt(&self, mut prompt_json: serde_json::Value) -> Result<Vec<OutputAsset>, String> {
+        let client_id = Uuid::new_v4().to_string();
+        let ws_image_nodes = self.salt_save_nodes(&mut prompt_json, &client_id);
+        let prompt_id = self.post_prompt(prompt_json, &client_id).await?;
+
         let mut cancel_guard = CancelOnDrop {
             http: self.http.clone(),
             base_url: self.base_url.clone(),
@@ -375,6 +403,38 @@ impl ComfyClient {
                 Self::walk_and_cleanup(&dir, &filenames);
             });
         }
+    }
+
+    pub async fn cancel_prompt(&self, prompt_id: &str) {
+        cancel_prompt(&self.http, &self.base_url, prompt_id).await;
+    }
+
+    /// The `/history/<prompt_id>` entry of a job, or `None` while it is not finished (or unknown).
+    pub async fn get_history(&self, prompt_id: &str) -> Result<Option<serde_json::Value>, String> {
+        let res = self.http.get(format!("{}/history/{}", self.base_url, prompt_id))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut history: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        Ok(history.get_mut(prompt_id).map(|h| h.take()))
+    }
+
+    pub async fn get_queue(&self) -> Result<serde_json::Value, String> {
+        let res = self.http.get(format!("{}/queue", self.base_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        res.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Opens an output file through `/view` without buffering it, so it can be streamed on.
+    pub async fn view(&self, filename: &str, subfolder: &str, folder_type: &str) -> Result<reqwest::Response, String> {
+        let res = self.http.get(format!("{}/view", self.base_url))
+            .query(&[("filename", filename), ("subfolder", subfolder), ("type", folder_type)])
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        res.error_for_status().map_err(|e| e.to_string())
     }
 
     pub async fn upload_file(&self, file_bytes: Vec<u8>, filename: &str) -> Result<String, String> {
