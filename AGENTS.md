@@ -87,6 +87,10 @@ Note: Standard `SaveImage` and `SaveAudio` nodes (including `SaveAudioAdvanced`,
 
 To prevent issues where files are deleted via `--cleanup` but ComfyUI caches the execution (resulting in missing files), `comfy-serve` also applies the cache-busting salt to all disk-saving nodes if `--cleanup` is enabled. Otherwise, these nodes rely on ComfyUI's default caching behavior.
 
+## Client Disconnect → Job Cancel
+
+When the client drops the HTTP request, axum drops the handler future. `submit_prompt` holds a `CancelOnDrop` guard (armed from submission until the WebSocket reports completion) that calls ComfyUI `POST /queue {"delete": [id]}` and, if `GET /queue` shows the job in `queue_running`, `POST /interrupt {"prompt_id": id}`. Handlers hold a `CleanupGuard` so uploaded input files and temp-hosted images are also removed on drop.
+
 ## Future Work
 
 - **Workflow Queuing**: Currently, `comfy-serve` opens a WebSocket connection and waits synchronously for the image to generate. If many requests come in, this could hold many open connections. Consider switching to an async task polling model if traffic scales.
