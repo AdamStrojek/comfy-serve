@@ -10,6 +10,9 @@
 //! (`VideoWorkflowConfig`, whose defaults are the MiniMax H3 conventions). It carries two generator
 //! variants, `i2v_node` (text/first+last frame to video) and `r2v_node` (reference images/audio/videos
 //! to video); the one a request needs becomes `generator_node`, which the rest of the graph links to.
+//! When the variants need different model chains (UNET, LoRA, sampler...), the nodes of a variant are
+//! keyed `i2v:<id>` / `r2v:<id>`: the chosen variant's nodes lose the prefix, the other's are dropped,
+//! so shared nodes link to `<id>`. `i2v:<generator_node>` / `r2v:<generator_node>` work as generators too.
 
 use axum::{
     body::{Body, Bytes},
@@ -26,6 +29,9 @@ use crate::AppState;
 
 const VIDEO_DIR: &str = "active-workflows/video";
 const VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "webm", "mov", "mkv"];
+/// Prefixes of the node ids that belong to one generator variant only
+const I2V_PREFIX: &str = "i2v:";
+const R2V_PREFIX: &str = "r2v:";
 
 type ApiError = (StatusCode, String);
 
@@ -264,12 +270,29 @@ fn build_video_prompt(
         return Err(bad_request("Send either first_frame/last_frame or image/audio/video references, not both"));
     }
 
+    let (keep, drop) = if has_references { (R2V_PREFIX, I2V_PREFIX) } else { (I2V_PREFIX, R2V_PREFIX) };
+    let variant_ids: Vec<String> = wf.keys().filter(|k| k.starts_with(keep) || k.starts_with(drop)).cloned().collect();
+    for id in variant_ids {
+        let node = wf.remove(&id).unwrap_or_default();
+        if let Some(stripped) = id.strip_prefix(keep) {
+            if wf.contains_key(stripped) {
+                return Err(config_error(format!("Video workflow has both '{}' and '{}'", id, stripped)));
+            }
+            wf.insert(stripped.to_string(), node);
+        }
+    }
+
     let i2v = wf.remove(&cfg.i2v_node);
     let r2v = wf.remove(&cfg.r2v_node);
     let (variant, generator) = if has_references { (&cfg.r2v_node, r2v) } else { (&cfg.i2v_node, i2v) };
-    let generator = generator.ok_or_else(|| bad_request(format!("This workflow has no '{}' node for this kind of request", variant)))?;
     let generator_id = cfg.generator_node.as_str();
-    wf.insert(generator_id.to_string(), generator);
+    match generator {
+        Some(generator) => {
+            wf.insert(generator_id.to_string(), generator);
+        }
+        None if wf.contains_key(generator_id) => {}
+        None => return Err(bad_request(format!("This workflow has no '{}' node for this kind of request", variant))),
+    }
 
     set_input(wf, generator_id, &cfg.prompt_field, json!(params.prompt))?;
     set_input(wf, generator_id, &cfg.width_field, json!(width))?;
@@ -696,7 +719,7 @@ mod tests {
     fn test_calc_resolution() {
         let c = cfg();
         let res = |j: Value| calc_resolution(&params(j), &c);
-        assert_eq!(res(json!({"model": "m", "prompt": "p"})).unwrap(), (832, 512));
+        assert_eq!(res(json!({"model": "m", "prompt": "p"})).unwrap(), (1344, 768));
         assert_eq!(res(json!({"model": "m", "prompt": "p", "resolution": "720p", "aspect_ratio": "9:16"})).unwrap(), (704, 1280));
         assert_eq!(res(json!({"model": "m", "prompt": "p", "size": "1280x720"})).unwrap(), (1280, 704));
         assert!(res(json!({"model": "m", "prompt": "p", "resolution": "4K"})).is_err());
@@ -782,6 +805,47 @@ mod tests {
 
         let mixed = VideoInputs { first_frame: Some("f.png".into()), images: vec!["a.png".into()], ..Default::default() };
         assert!(build_video_prompt(template(), &cfg(), &params(json!({"model": "m", "prompt": "p"})), &mixed, 1).is_err());
+    }
+
+    #[test]
+    fn test_build_variant_nodes() {
+        let tpl = json!({
+            "i2v:unet": {"class_type": "UNETLoader", "inputs": {"unet_name": "fl2v"}},
+            "r2v:unet": {"class_type": "UNETLoader", "inputs": {"unet_name": "ref2v"}},
+            "i2v:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["unet", 0]}},
+            "r2v:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["unet", 0]}},
+            "i2v:generator": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {}},
+            "r2v:generator": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {}},
+            "guider": {"class_type": "BasicGuider", "inputs": {"model": ["unet", 0], "conditioning": ["generator", 0]}},
+            "rnd_seed": {"class_type": "RandomNoise", "inputs": {}},
+            "video_output": {"class_type": "SaveVideo", "inputs": {}}
+        });
+        let p = params(json!({"model": "m", "prompt": "p"}));
+        let no_prefix = |wf: &Value| wf.as_object().unwrap().keys().all(|k| !k.starts_with(I2V_PREFIX) && !k.starts_with(R2V_PREFIX));
+
+        let wf = build_video_prompt(tpl.clone(), &cfg(), &p, &VideoInputs::default(), 1).unwrap();
+        assert!(no_prefix(&wf));
+        assert_eq!(wf["unet"]["inputs"]["unet_name"], "fl2v");
+        assert_eq!(wf["generator"]["class_type"], "MiniMaxH3ImageToVideo");
+        assert_eq!(wf["generator"]["inputs"]["prompt"], "p");
+        assert_eq!(wf["scheduler"]["inputs"]["denoise"], 1);
+
+        let refs = VideoInputs { images: vec!["a.png".into()], ..Default::default() };
+        let wf = build_video_prompt(tpl.clone(), &cfg(), &p, &refs, 1).unwrap();
+        assert!(no_prefix(&wf));
+        assert_eq!(wf["unet"]["inputs"]["unet_name"], "ref2v");
+        assert_eq!(wf["generator"]["class_type"], "MiniMaxH3ReferenceToVideo");
+        assert_eq!(wf["generator"]["inputs"]["ref_images.ref_image_0"], json!(["ref_image_0", 0]));
+
+        // A variant node may not shadow a shared one
+        let mut clash = tpl.clone();
+        clash["unet"] = json!({"class_type": "UNETLoader", "inputs": {}});
+        assert_eq!(build_video_prompt(clash, &cfg(), &p, &VideoInputs::default(), 1).unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Only an i2v generator: references are rejected
+        let mut i2v_only = tpl;
+        i2v_only.as_object_mut().unwrap().remove("r2v:generator");
+        assert_eq!(build_video_prompt(i2v_only, &cfg(), &p, &refs, 1).unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     #[test]

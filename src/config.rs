@@ -145,7 +145,7 @@ impl Default for VideoWorkflowConfig {
             size_multiple: 64,
             resolutions: ["360p", "480p", "720p", "768p", "1080p"].map(s).to_vec(),
             aspect_ratios: ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"].map(s).to_vec(),
-            default_resolution: s("480p"),
+            default_resolution: s("768p"),
             default_aspect_ratio: s("16:9"),
             max_images: None,
             max_audios: None,
