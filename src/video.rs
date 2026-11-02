@@ -707,7 +707,8 @@ mod tests {
         let check = |d: u64, c: &VideoWorkflowConfig| check_duration(&params(json!({"model": "m", "prompt": "p", "duration": d})), c);
         assert_eq!(check(5, &cfg()).unwrap(), 5);
         assert_eq!(check(15, &cfg()).unwrap(), 15);
-        assert!(check(4, &cfg()).is_err());
+        assert_eq!(check(3, &cfg()).unwrap(), 3);
+        assert!(check(2, &cfg()).is_err());
         assert!(check(16, &cfg()).is_err());
         assert!(check(15, &VideoWorkflowConfig { max_duration: 10, ..cfg() }).is_err());
         assert_eq!(check_duration(&params(json!({"model": "m", "prompt": "p"})), &cfg()).unwrap(), 5);
@@ -737,7 +738,8 @@ mod tests {
         let p = params(json!({"model": "minimax_h3", "prompt": "a cat", "duration": 6}));
         let inputs = VideoInputs { first_frame: Some("f.png".into()), last_frame: Some("l.png".into()), ..Default::default() };
         let wf = build_video_prompt(template(), &cfg(), &p, &inputs, 42).unwrap();
-        assert!(wf.get("generator_i2v").is_none() && wf.get("generator_r2v").is_none());
+        assert!(wf.as_object().unwrap().keys().all(|k| !k.starts_with(I2V_PREFIX) && !k.starts_with(R2V_PREFIX)));
+        assert_eq!(wf["model_sd"]["inputs"]["unet_name"], "minimax_h3_fl2va_pruned_int8_convrot.safetensors");
         let g = &wf["generator"];
         assert_eq!(g["class_type"], "MiniMaxH3ImageToVideo");
         assert_eq!(g["inputs"]["prompt"], "a cat");
@@ -789,6 +791,7 @@ mod tests {
         let wf = build_video_prompt(template(), &cfg(), &p, &inputs, 1).unwrap();
         let g = &wf["generator"]["inputs"];
         assert_eq!(wf["generator"]["class_type"], "MiniMaxH3ReferenceToVideo");
+        assert_eq!(wf["model_sd"]["inputs"]["unet_name"], "minimax_h3_ref2va_pruned_int8_convrot.safetensors");
         assert_eq!(g["ref_images.ref_image_1"], json!(["ref_image_1", 0]));
         assert_eq!(wf["ref_image_1"]["inputs"]["image"], "b.png");
         assert_eq!(g["ref_videos.ref_video_0"], json!(["ref_video_components_0", 0]));

@@ -56,7 +56,7 @@ Without any files, you get a video from text alone (text-to-video). In that case
 |---|---|---|---|
 | `model` | string (**required**) | – | Model name, see [`GET /api/v1/videos/models`](#5-list-models-get-apiv1videosmodels). |
 | `prompt` | string (**required**) | – | Description of the video. |
-| `duration` | integer | `5` | Length in seconds: **a whole number from 5 to 15**. |
+| `duration` | integer | `5` | Length in seconds: **a whole number from 3 to 15**. |
 | `resolution` | string | `"768p"` | `360p`, `480p`, `720p`, `768p`, `1080p`. This is the length of the shorter side. |
 | `aspect_ratio` | string | `"16:9"` | `16:9`, `9:16`, `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `21:9`, `9:21` |
 | `size` | string | – | Exact size `WIDTHxHEIGHT`, e.g. `"1280x720"`, **instead of** `resolution` + `aspect_ratio`. Sides are rounded to multiples of 64. |
@@ -224,7 +224,7 @@ curl "$BASE/api/v1/videos/models" -H "Authorization: Bearer $API_KEY"
       "id": "minimax_h3_fast",
       "name": "minimax_h3_fast",
       "created": 1792743253,
-      "supported_durations": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      "supported_durations": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
       "supported_resolutions": ["360p", "480p", "720p", "768p", "1080p"],
       "supported_aspect_ratios": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"],
       "supported_inputs": ["first_frame", "last_frame", "image", "audio", "video"]
@@ -254,7 +254,7 @@ All of them take the same parameters and both modes (frames or references).
 Every error has the same format:
 
 ```json
-{ "error": { "code": 400, "message": "duration must be a whole number of seconds from 5 to 15" } }
+{ "error": { "code": 400, "message": "duration must be a whole number of seconds from 3 to 15" } }
 ```
 
 | Code | When |

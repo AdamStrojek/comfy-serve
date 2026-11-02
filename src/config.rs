@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LlmConfig {
@@ -136,7 +136,7 @@ impl Default for VideoWorkflowConfig {
             seed_field: s("noise_seed"),
             denoise_node: s("scheduler"),
             output_node: s("video_output"),
-            min_duration: 5,
+            min_duration: 3,
             max_duration: 15,
             default_duration: 5,
             fps: 24,
@@ -144,7 +144,11 @@ impl Default for VideoWorkflowConfig {
             frame_offset: 5,
             size_multiple: 64,
             resolutions: ["360p", "480p", "720p", "768p", "1080p"].map(s).to_vec(),
-            aspect_ratios: ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"].map(s).to_vec(),
+            aspect_ratios: [
+                "16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21",
+            ]
+            .map(s)
+            .to_vec(),
             default_resolution: s("768p"),
             default_aspect_ratio: s("16:9"),
             max_images: None,
@@ -229,7 +233,8 @@ mod tests {
 
     #[test]
     fn test_image_inputs_optional() {
-        let old: WorkflowConfig = toml::from_str("active = true\nfile_name = \"a\"\nexposed_fields = []").unwrap();
+        let old: WorkflowConfig =
+            toml::from_str("active = true\nfile_name = \"a\"\nexposed_fields = []").unwrap();
         assert!(old.image_inputs.is_none());
 
         let new: WorkflowConfig = toml::from_str(
@@ -249,7 +254,13 @@ mod tests {
             "comfyui_url = \"x\"\n[workflows]\n[video_workflows.minimax_h3]\nactive = true\n[video_workflows.other]\nactive = true\nmax_duration = 10\nresolutions = [\"720p\"]",
         ).unwrap();
         let minimax = &cfg.video_workflows["minimax_h3"];
-        assert_eq!(minimax, &VideoWorkflowConfig { active: true, ..Default::default() });
+        assert_eq!(
+            minimax,
+            &VideoWorkflowConfig {
+                active: true,
+                ..Default::default()
+            }
+        );
         let other = &cfg.video_workflows["other"];
         assert_eq!(other.max_duration, 10);
         assert_eq!(other.resolutions, vec!["720p"]);
